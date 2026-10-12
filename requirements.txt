@@ -1,0 +1,14 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+opencv-python-headless>=4.9
+Pillow>=10.0
+numpy>=1.26
+paddleocr>=2.7
+paddlepaddle>=2.6
+easyocr>=1.7
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+arabic-reshaper>=3.0
+python-bidi>=0.4
+python-multipart>=0.0.9
