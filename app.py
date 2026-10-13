@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 import cv2
 import httpx
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
