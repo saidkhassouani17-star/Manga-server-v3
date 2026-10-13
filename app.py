@@ -52,7 +52,7 @@ app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-VERSION = "v4.1-20261013"
+VERSION = "v4.3-20261013"
 
 # Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
 USE_LAMA = True
@@ -76,12 +76,53 @@ def get_ocr():
     except Exception as e:
         log.warning("PaddleOCR failed (%s), falling back to EasyOCR", e)
         import easyocr
-        # EasyOCR: ch_sim only works with en, can't mix with ja/ko
-        # Use English-only for fallback (PaddleOCR handles multilingual)
-        _ocr_reader = easyocr.Reader(["en"], gpu=False)
+        # EasyOCR: ch_sim only works with en, can't mix with ja/ko.
+        # Korean manhwa is the main use case, so ko+en (PaddleOCR, when it
+        # loads, handles the rest multilingually).
+        _ocr_reader = easyocr.Reader(["ko", "en"], gpu=False)
         _ocr_backend = "easyocr"
-        log.info("EasyOCR ready")
+        log.info("EasyOCR ready (ko+en)")
     return _ocr_reader, _ocr_backend
+
+
+def merge_regions(regions: List[dict]) -> List[dict]:
+    """Merge OCR fragments belonging to the same text block.
+
+    EasyOCR returns line-level boxes; a bubble's sentence split across lines
+    must be translated as ONE unit, otherwise each fragment is translated in
+    isolation and loses context (e.g. "TO SAY?" -> wrong pronoun).
+    Two regions merge if they are horizontally aligned and vertically close.
+    """
+    if len(regions) <= 1:
+        return regions
+    groups = []  # {"box": [...], "texts": [...], "scores": [...]}
+    for r in sorted(regions, key=lambda r: (r["box"][1], r["box"][0])):
+        x1, y1, x2, y2 = r["box"]
+        h = max(1, y2 - y1)
+        target = None
+        for g in groups:
+            gx1, gy1, gx2, gy2 = g["box"]
+            gh = max(1, gy2 - gy1)
+            overlap = max(0, min(x2, gx2) - max(x1, gx1))
+            min_w = max(1, min(x2 - x1, gx2 - gx1))
+            v_gap = max(gy1 - y2, y1 - gy2, 0)
+            if overlap / min_w > 0.2 and v_gap < max(h, gh) * 1.5:
+                target = g
+                break
+        if target is None:
+            groups.append({"box": [x1, y1, x2, y2],
+                           "texts": [r["text"]], "scores": [r["score"]]})
+        else:
+            b = target["box"]
+            b[0] = min(b[0], x1); b[1] = min(b[1], y1)
+            b[2] = max(b[2], x2); b[3] = max(b[3], y2)
+            target["texts"].append(r["text"])
+            target["scores"].append(r["score"])
+    out = [{"text": " ".join(g["texts"]), "box": g["box"],
+            "score": min(g["scores"])} for g in groups]
+    out.sort(key=lambda r: (r["box"][1], r["box"][0]))
+    log.info("Merged %d OCR fragments -> %d text blocks", len(regions), len(out))
+    return out
 
 
 def run_ocr(image_bytes: bytes) -> List[dict]:
@@ -311,6 +352,23 @@ def render_translations(image_bytes: bytes, items: List[dict],
     arr = np.array(img)
     rtl = target_lang.lower() in RTL_LANGS
 
+    # Drop regions the provider echoed back untranslated (translated == source):
+    # drawing them would render tofu boxes for scripts the font lacks.
+    # Leaving them untouched keeps the original text readable instead.
+    kept = []
+    for it in items:
+        src, dst = (it.get("text") or "").strip(), (it.get("translated") or "").strip()
+        if dst and dst != src:
+            kept.append(it)
+        else:
+            log.warning("Skipping untranslated region (leaving original): %r", src[:60])
+    items = kept
+    if not items:
+        log.info("No translatable regions; returning original image")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92)
+        return buf.getvalue()
+
     # 1. Inpaint original text areas
     mask = np.zeros(arr.shape[:2], dtype=np.uint8)
     for it in items:
@@ -482,6 +540,8 @@ async def translate(
             b64 = base64.b64encode(image_bytes).decode()
             return {"translated_image": b64, "provider_used": None,
                     "regions": 0}
+        # Merge fragments of the same bubble/sentence so translation keeps context
+        regions = merge_regions(regions)
         # 2. Translate each region (concurrently)
         try:
             glossary_dict = json.loads(glossary) if glossary else {}
