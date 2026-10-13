@@ -52,7 +52,7 @@ app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-VERSION = "v4.8-20261013"
+VERSION = "v4.9-20261013"
 
 # Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
 USE_LAMA = True
@@ -63,24 +63,16 @@ _ocr_backend = None  # "paddle" or "easyocr"
 
 
 def get_ocr():
-    """Lazy-load OCR engine. Prefer RapidOCR (PaddleOCR models, ONNX),
-    fall back to EasyOCR."""
+    """Lazy-load OCR engine. EasyOCR (English). RapidOCR misreads English
+    comic text as Chinese/garbage, so it's disabled."""
     global _ocr_reader, _ocr_backend
     if _ocr_reader is not None:
         return _ocr_reader, _ocr_backend
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        log.info("Loading RapidOCR (PaddleOCR models via ONNX)...")
-        _ocr_reader = RapidOCR()
-        _ocr_backend = "rapidocr"
-        log.info("RapidOCR ready")
-    except Exception as e:
-        log.warning("RapidOCR failed (%s), falling back to EasyOCR", e)
-        import easyocr
-        # English-only: the content is English (translated manhwa).
-        _ocr_reader = easyocr.Reader(["en"], gpu=False)
-        _ocr_backend = "easyocr"
-        log.info("EasyOCR ready (en)")
+    import easyocr
+    # English-only: the content is English (translated manhwa).
+    _ocr_reader = easyocr.Reader(["en"], gpu=False)
+    _ocr_backend = "easyocr"
+    log.info("EasyOCR ready (en)")
     return _ocr_reader, _ocr_backend
 
 
@@ -173,19 +165,7 @@ def run_ocr(image_bytes: bytes) -> List[dict]:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     arr = np.array(img)
     results = []
-    if backend == "rapidocr":
-        out, _ = reader(arr)
-        # RapidOCR returns [[box, text, score], ...], box = 4 points
-        for item in (out or []):
-            pts, text, score = item[0], item[1], item[2]
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            results.append({
-                "text": text.strip(),
-                "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
-                "score": float(score),
-            })
-    elif backend == "paddle":
+    if backend == "paddle":
         out = reader.ocr(arr, cls=False)
         # PaddleOCR returns [[ [points], (text, score) ], ...]
         pages = out[0] if out and out[0] else []
