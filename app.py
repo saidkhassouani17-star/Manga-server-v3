@@ -52,7 +52,7 @@ app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-VERSION = "v4-20261013"
+VERSION = "v4.1-20261013"
 
 # Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
 USE_LAMA = True
@@ -224,6 +224,8 @@ async def translate_all(regions: List[dict], target_lang: str,
     provider_used = None
     for r, (t, p) in zip(regions, results):
         r["translated"] = t
+        log.info("Region OCR=%r -> translated=%r (via %s)",
+                 r["text"][:80], t[:80], p)
         if provider_used is None and p:
             provider_used = p
     return provider_used
@@ -474,7 +476,12 @@ async def translate(
         # 1. OCR
         regions = run_ocr(image_bytes)
         if not regions:
-            raise ValueError("No text detected in image")
+            # Page has no text: nothing to translate. Return the original
+            # image so the reader shows it normally instead of an error.
+            log.info("No text detected; returning original image")
+            b64 = base64.b64encode(image_bytes).decode()
+            return {"translated_image": b64, "provider_used": None,
+                    "regions": 0}
         # 2. Translate each region (concurrently)
         try:
             glossary_dict = json.loads(glossary) if glossary else {}
