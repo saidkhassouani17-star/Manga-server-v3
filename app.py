@@ -52,7 +52,7 @@ app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-VERSION = "v4.6-20261013"
+VERSION = "v4.7-20261013"
 
 # Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
 USE_LAMA = True
@@ -83,23 +83,47 @@ def get_ocr():
     return _ocr_reader, _ocr_backend
 
 
-def downscale_image(image_bytes: bytes, max_dim: int = 1280) -> bytes:
-    """Downscale a page whose largest side exceeds max_dim.
+def downscale_image(image_bytes: bytes, max_width: int = 1000) -> bytes:
+    """Downscale a page whose WIDTH exceeds max_width.
 
-    OCR + LaMa on CPU are dramatically faster on a smaller image, and 1280px
+    Webtoon pages are long and narrow: scaling by max dimension would make
+    the text microscopic and unreadable for OCR. Limit by width only.
+    OCR + LaMa on CPU are much faster on a smaller image, and 1000px wide
     is plenty for phone display. Returns JPEG bytes (original if already small).
     """
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
-    if max(w, h) <= max_dim:
+    if w <= max_width:
         return image_bytes
-    scale = max_dim / max(w, h)
+    scale = max_width / w
     nw, nh = int(w * scale), int(h * scale)
     img = img.convert("RGB").resize((nw, nh), Image.LANCZOS)
     log.info("Downscaled page %dx%d -> %dx%d for faster processing", w, h, nw, nh)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()
+
+
+def clean_text(text: str) -> str:
+    """Remove characters the fonts can't render (prevents tofu boxes).
+
+    Keeps Arabic, Latin, digits, common punctuation and whitespace.
+    Drops everything else (CJK, symbols, control codes...).
+    """
+    kept = []
+    for ch in text:
+        o = ord(ch)
+        if (0x0600 <= o <= 0x06FF or   # Arabic
+                0xFB50 <= o <= 0xFDFF or   # Arabic presentation A
+                0xFE70 <= o <= 0xFEFF or   # Arabic presentation B
+                0x0020 <= o <= 0x024F or   # Latin + extended
+                0x2000 <= o <= 0x206F or   # General punctuation
+                ch in "\n\t"):
+            kept.append(ch)
+    out = "".join(kept).strip()
+    if out != text.strip():
+        log.warning("Stripped unrunderable chars: %r -> %r", text[:60], out[:60])
+    return out
 
 
 def merge_regions(regions: List[dict]) -> List[dict]:
@@ -419,7 +443,7 @@ def render_translations(image_bytes: bytes, items: List[dict],
 
     # 2. Draw translated text
     for it in items:
-        text = it["translated"]
+        text = clean_text(it["translated"])
         if not text:
             continue
         if rtl:
@@ -548,9 +572,10 @@ async def translate(
         image_bytes = await image.read()
         if not image_bytes:
             raise ValueError("Empty image")
-        # Downscale huge pages first: OCR + LaMa on CPU are much faster,
-        # and 1280px is plenty for phone display.
-        image_bytes = downscale_image(image_bytes, max_dim=1280)
+        # Downscale huge pages first: OCR + LaMa on CPU are much faster.
+        # (Width-based: webtoon pages are long/narrow, height-based scaling
+        # would make text microscopic.)
+        image_bytes = downscale_image(image_bytes, max_width=1000)
         # 1. OCR
         regions = run_ocr(image_bytes)
         if not regions:
