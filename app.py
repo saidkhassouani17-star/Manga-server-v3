@@ -1,9 +1,36 @@
 """
-Manga Translation Server V3 — Server-does-everything.
+Manga Translation Server V4 — Server-does-everything.
 - POST /translate: OCR -> translate -> inpaint -> render -> final image
 - POST /test-provider: verify DeepL/Groq/Gemini API keys
-- GET /health: liveness check
+- POST /list-models: list Gemini/Groq models
+- GET /health: liveness check (includes version, so deploys are verifiable)
+
+V4 changes (2026-10-13):
+1. SPEED: all text regions are now translated CONCURRENTLY (asyncio.gather,
+   max 5 in flight) instead of one sequential API call per region. A page
+   with N bubbles used to take N round-trips; now it takes ~1.
+2. RTL: arabic_reshaper/python-bidi failures are now LOGGED loudly instead of
+   silently falling back to unshaped text; Arabic-capable fonts are preferred
+   first for RTL targets (DejaVu Sans has no Arabic glyphs).
+3. INPAINT: optional LaMa inpainting (USE_LAMA=True). Falls back to the
+   strengthened OpenCV path on ANY LaMa failure, with a loud log line.
+   Needs: pip install simple-lama-inpainting  (first use downloads ~200MB
+   of model weights automatically; torch CPU is already a dependency).
+   NOTE: LaMa is much slower on CPU than OpenCV (seconds per page vs ~1s).
+4. /health now reports the running version, so you can verify which file
+   is actually deployed: curl http://localhost:8000/health
+
+Deploy (full-file replacement — never patch in place):
+1. Put this file's content into app.py in the Manga-server-v3 GitHub repo.
+2. On the EC2 instance:
+     sudo curl -sL https://raw.githubusercontent.com/saidkhassouani17-star/Manga-server-v3/main/app.py -o /opt/manga-server/app.py
+     # only if USE_LAMA=True and not installed yet:
+     sudo /opt/manga-server/venv/bin/pip install simple-lama-inpainting
+     sudo systemctl restart manga-api
+     sleep 3
+     curl -s http://localhost:8000/health   # must show "v4-20261013"
 """
+import asyncio
 import base64
 import io
 import json
@@ -24,6 +51,11 @@ log = logging.getLogger("manga-server")
 app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
+
+VERSION = "v4-20261013"
+
+# Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
+USE_LAMA = True
 
 # ---------------------------------------------------------------- OCR ----
 _ocr_reader = None
@@ -172,8 +204,76 @@ async def translate_text(text: str, target: str, priority: List[str],
     raise RuntimeError(f"All providers failed. Last error: {last_err}")
 
 
+async def translate_all(regions: List[dict], target_lang: str,
+                        priority: List[str], keys: dict, models: dict,
+                        glossary: dict) -> Optional[str]:
+    """Translate every region CONCURRENTLY. Returns provider used.
+
+    Same failure contract as before: if a region's providers all fail,
+    the exception propagates and /translate answers HTTP 500 with an
+    error (never a partial image).
+    """
+    sem = asyncio.Semaphore(5)
+
+    async def one(r: dict):
+        async with sem:
+            return await translate_text(r["text"], target_lang, priority,
+                                        keys, models, glossary)
+
+    results = await asyncio.gather(*(one(r) for r in regions))
+    provider_used = None
+    for r, (t, p) in zip(regions, results):
+        r["translated"] = t
+        if provider_used is None and p:
+            provider_used = p
+    return provider_used
+
+
+# ------------------------------------------------------------ inpaint ----
+_lama = None
+_lama_failed = False
+
+
+def get_lama():
+    """Lazy-load LaMa inpainting (simple-lama-inpainting, CPU)."""
+    global _lama, _lama_failed
+    if not USE_LAMA or _lama_failed:
+        return None
+    if _lama is None:
+        try:
+            from simple_lama_inpainting import SimpleLama
+            log.info("Loading LaMa inpainting model (first use downloads weights)...")
+            _lama = SimpleLama()
+            log.info("LaMa inpainting ready")
+        except Exception as e:
+            _lama_failed = True
+            log.error("LaMa failed to load (%s); using OpenCV inpaint instead", e)
+    return _lama
+
+
+def inpaint_opencv(arr, mask):
+    """Strengthened OpenCV inpaint: pad + dilated mask + INPAINT_NS."""
+    return cv2.inpaint(arr, mask, 15, cv2.INPAINT_NS)
+
+
+def inpaint_with_lama(arr, mask, lama):
+    img_pil = Image.fromarray(arr).convert("RGB")
+    mask_pil = Image.fromarray(mask).convert("L")
+    out = lama(img_pil, mask_pil)
+    return np.array(out.convert("RGB"))
+
+
 # ----------------------------------------------------------- render ----
 RTL_LANGS = {"ar", "he", "fa", "ur"}
+
+ARABIC_FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+]
+LATIN_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
 
 
 def shape_rtl(text: str) -> str:
@@ -181,22 +281,24 @@ def shape_rtl(text: str) -> str:
         import arabic_reshaper
         from bidi.algorithm import get_display
         return get_display(arabic_reshaper.reshape(text))
-    except Exception:
+    except Exception as e:
+        # LOUD failure: silent fallback was the cause of "Arabic reads LTR"
+        log.error("RTL shaping unavailable (%s): install arabic-reshaper + python-bidi", e)
         return text
 
 
-def find_font(size: int) -> ImageFont.FreeTypeFont:
-    # Try common fonts that support Arabic
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]:
+def find_font(size: int, rtl: bool = False) -> ImageFont.FreeTypeFont:
+    # DejaVu Sans has NO Arabic glyphs, so for RTL targets try
+    # Arabic-capable fonts first.
+    paths = (ARABIC_FONT_PATHS + LATIN_FONT_PATHS) if rtl else \
+            (LATIN_FONT_PATHS + ARABIC_FONT_PATHS)
+    for path in paths:
         if os.path.exists(path):
             try:
                 return ImageFont.truetype(path, size)
             except Exception:
                 pass
+    log.error("No usable font file found; falling back to PIL default bitmap font")
     return ImageFont.load_default()
 
 
@@ -207,7 +309,7 @@ def render_translations(image_bytes: bytes, items: List[dict],
     arr = np.array(img)
     rtl = target_lang.lower() in RTL_LANGS
 
-    # 1. Inpaint original text areas (STRONG)
+    # 1. Inpaint original text areas
     mask = np.zeros(arr.shape[:2], dtype=np.uint8)
     for it in items:
         x1, y1, x2, y2 = it["box"]
@@ -219,8 +321,22 @@ def render_translations(image_bytes: bytes, items: List[dict],
     # Dilate mask to ensure full text coverage
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     mask = cv2.dilate(mask, kernel, iterations=2)
-    # Strong inpaint with larger radius
-    arr = cv2.inpaint(arr, mask, 15, cv2.INPAINT_NS)
+
+    lama = get_lama()
+    backend_name = "opencv"
+    if lama is not None:
+        try:
+            log.info("Inpainting %d regions with LaMa (CPU, may take a while)...",
+                     len(items))
+            arr = inpaint_with_lama(arr, mask, lama)
+            backend_name = "lama"
+        except Exception as e:
+            log.error("LaMa inpaint failed (%s); falling back to OpenCV", e)
+            arr = inpaint_opencv(arr, mask)
+    else:
+        arr = inpaint_opencv(arr, mask)
+    log.info("Inpaint backend used: %s", backend_name)
+
     img = Image.fromarray(arr)
     draw = ImageDraw.Draw(img)
 
@@ -235,7 +351,7 @@ def render_translations(image_bytes: bytes, items: List[dict],
         bw, bh = max(1, x2 - x1), max(1, y2 - y1)
         # Auto-fit font size
         size = max(8, bh // 2)
-        font = find_font(size)
+        font = find_font(size, rtl=rtl)
         # Shrink until it fits
         while size > 8:
             bbox = draw.multiline_textbbox((0, 0), text, font=font)
@@ -243,7 +359,7 @@ def render_translations(image_bytes: bytes, items: List[dict],
             if tw <= bw * 0.95 and th <= bh * 0.95:
                 break
             size -= 2
-            font = find_font(size)
+            font = find_font(size, rtl=rtl)
         bbox = draw.multiline_textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         tx = x1 + (bw - tw) // 2
@@ -266,7 +382,7 @@ def check_token(token: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": VERSION}
 
 
 @app.post("/test-provider")
@@ -359,7 +475,7 @@ async def translate(
         regions = run_ocr(image_bytes)
         if not regions:
             raise ValueError("No text detected in image")
-        # 2. Translate each region
+        # 2. Translate each region (concurrently)
         try:
             glossary_dict = json.loads(glossary) if glossary else {}
         except Exception:
@@ -367,11 +483,8 @@ async def translate(
         keys = {"deepl": deepl_key, "groq": groq_key, "gemini": gemini_key}
         models = {"groq": groq_model, "gemini": gemini_model}
         priority = [p for p in provider_priority.split(",") if p.strip()]
-        provider_used = None
-        for r in regions:
-            translated, provider_used = await translate_text(
-                r["text"], target_lang, priority, keys, models, glossary_dict)
-            r["translated"] = translated
+        provider_used = await translate_all(regions, target_lang, priority,
+                                            keys, models, glossary_dict)
         # 3. Render
         out_bytes = render_translations(image_bytes, regions, target_lang)
         b64 = base64.b64encode(out_bytes).decode()
@@ -383,3 +496,22 @@ async def translate(
         log.exception("translate failed")
         # NEVER return the original image on failure — error only
         return JSONResponse(status_code=500, content={"error": str(e)[:300]})
+
+
+def _startup_checks():
+    """Log environment sanity at import so journalctl shows what's missing."""
+    try:
+        import arabic_reshaper  # noqa: F401
+        from bidi.algorithm import get_display  # noqa: F401
+        log.info("RTL shaping: available (arabic_reshaper + python-bidi)")
+    except Exception as e:
+        log.error("RTL shaping NOT available (%s): Arabic will render LTR/disconnected", e)
+    found = [p for p in ARABIC_FONT_PATHS + LATIN_FONT_PATHS if os.path.exists(p)]
+    if found:
+        log.info("Font files found: %s", found)
+    else:
+        log.error("NO font files found; Arabic/Latin will use PIL default bitmap font")
+    log.info("LaMa inpaint: %s", "ENABLED (USE_LAMA=True)" if USE_LAMA else "disabled")
+
+
+_startup_checks()
