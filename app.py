@@ -52,7 +52,7 @@ app = FastAPI(title="Manga Translation Server")
 
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
-VERSION = "v4.3-20261013"
+VERSION = "v4.5-20261013"
 
 # Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
 USE_LAMA = True
@@ -76,12 +76,10 @@ def get_ocr():
     except Exception as e:
         log.warning("PaddleOCR failed (%s), falling back to EasyOCR", e)
         import easyocr
-        # EasyOCR: ch_sim only works with en, can't mix with ja/ko.
-        # Korean manhwa is the main use case, so ko+en (PaddleOCR, when it
-        # loads, handles the rest multilingually).
-        _ocr_reader = easyocr.Reader(["ko", "en"], gpu=False)
+        # English-only: the content is English (translated manhwa).
+        _ocr_reader = easyocr.Reader(["en"], gpu=False)
         _ocr_backend = "easyocr"
-        log.info("EasyOCR ready (ko+en)")
+        log.info("EasyOCR ready (en)")
     return _ocr_reader, _ocr_backend
 
 
@@ -579,6 +577,15 @@ def _startup_checks():
     else:
         log.error("NO font files found; Arabic/Latin will use PIL default bitmap font")
     log.info("LaMa inpaint: %s", "ENABLED (USE_LAMA=True)" if USE_LAMA else "disabled")
+    # Preload OCR at startup so the first /translate request doesn't pay the
+    # model download + load time (which can exceed the app's timeout).
+    # Wrapped: startup must never fail because of this.
+    try:
+        log.info("Preloading OCR engine (one-time cost at startup)...")
+        get_ocr()
+        log.info("OCR preload complete")
+    except Exception as e:
+        log.error("OCR preload failed (%s); will load lazily on first request", e)
 
 
 _startup_checks()
