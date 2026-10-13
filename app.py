@@ -44,7 +44,9 @@ def get_ocr():
     except Exception as e:
         log.warning("PaddleOCR failed (%s), falling back to EasyOCR", e)
         import easyocr
-        _ocr_reader = easyocr.Reader(["en", "ja", "ko", "ch_sim"], gpu=False)
+        # EasyOCR: ch_sim only works with en, can't mix with ja/ko
+        # Use English-only for fallback (PaddleOCR handles multilingual)
+        _ocr_reader = easyocr.Reader(["en"], gpu=False)
         _ocr_backend = "easyocr"
         log.info("EasyOCR ready")
     return _ocr_reader, _ocr_backend
@@ -95,7 +97,8 @@ async def translate_deepl(text: str, target: str, key: str,
         base = "https://api-free.deepl.com"
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(f"{base}/v2/translate",
-                         data={"auth_key": key, "text": text,
+                         headers={"Authorization": f"DeepL-Auth-Key {key}"},
+                         json={"text": [text],
                                "target_lang": target.upper()})
         r.raise_for_status()
         return r.json()["translations"][0]["text"]
@@ -284,6 +287,48 @@ async def test_provider(payload: dict, x_api_token: str = Header(default="")):
         return {"working": True, "sample": t[:80]}
     except Exception as e:
         return {"working": False, "error": str(e)[:200]}
+
+
+@app.post("/list-models")
+async def list_models(request: Request, x_api_token: str = Header(None)):
+    check_token(x_api_token or "")
+    payload = await request.json()
+    provider = payload.get("provider", "").lower()
+    key = payload.get("api_key", "")
+    if not key:
+        return {"models": [], "error": "No API key provided"}
+    try:
+        if provider == "gemini":
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get(
+                    f"https://generativelanguage.googleapis.com/v1beta/models?key={key}")
+                r.raise_for_status()
+                data = r.json()
+                models = []
+                for m in data.get("models", []):
+                    name = m.get("name", "").replace("models/", "")
+                    # Only text generation models
+                    methods = m.get("supportedGenerationMethods", [])
+                    if "generateContent" in methods:
+                        models.append({
+                            "id": name,
+                            "name": m.get("displayName", name),
+                        })
+                return {"models": models}
+        elif provider == "groq":
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.get(
+                    "https://api.groq.com/openai/v1/models",
+                    headers={"Authorization": f"Bearer {key}"})
+                r.raise_for_status()
+                data = r.json()
+                models = [{"id": m["id"], "name": m["id"]}
+                          for m in data.get("data", [])]
+                return {"models": models}
+        else:
+            return {"models": [], "error": f"Model listing not supported for: {provider}"}
+    except Exception as e:
+        return {"models": [], "error": str(e)[:200]}
 
 
 @app.post("/translate")
