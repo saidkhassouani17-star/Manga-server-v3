@@ -207,16 +207,20 @@ def render_translations(image_bytes: bytes, items: List[dict],
     arr = np.array(img)
     rtl = target_lang.lower() in RTL_LANGS
 
-    # 1. Inpaint original text areas
+    # 1. Inpaint original text areas (STRONG)
     mask = np.zeros(arr.shape[:2], dtype=np.uint8)
     for it in items:
         x1, y1, x2, y2 = it["box"]
-        pad = 3
+        pad = 10  # Larger padding to cover text edges
         cv2.rectangle(mask,
                       (max(0, x1 - pad), max(0, y1 - pad)),
                       (min(arr.shape[1], x2 + pad), min(arr.shape[0], y2 + pad)),
                       255, -1)
-    arr = cv2.inpaint(arr, mask, 5, cv2.INPAINT_TELEA)
+    # Dilate mask to ensure full text coverage
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    # Strong inpaint with larger radius
+    arr = cv2.inpaint(arr, mask, 15, cv2.INPAINT_NS)
     img = Image.fromarray(arr)
     draw = ImageDraw.Draw(img)
 
