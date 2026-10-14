@@ -514,12 +514,13 @@ async def startup_preload():
 
 
 
+
 @app.get("/test-provider")
 @app.post("/test-provider")
 @app.get("/test")
 @app.post("/test")
 async def test_provider_endpoint(request: Request):
-    return {"status": "ok", "message": "Provider is working"}
+    return {"status": "success", "success": True, "message": "Provider is working"}
 
 
 @app.get("/")
