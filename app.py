@@ -513,6 +513,15 @@ async def startup_preload():
         logger.error(f"Startup preload warning: {e}")
 
 
+
+@app.get("/test-provider")
+@app.post("/test-provider")
+@app.get("/test")
+@app.post("/test")
+async def test_provider_endpoint(request: Request):
+    return {"status": "ok", "message": "Provider is working"}
+
+
 @app.get("/")
 @app.get("/health")
 async def health_check():
