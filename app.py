@@ -1,631 +1,662 @@
+# -*- coding: utf-8 -*-
 """
-Manga Translation Server V4 — Server-does-everything.
-- POST /translate: OCR -> translate -> inpaint -> render -> final image
-- POST /test-provider: verify DeepL/Groq/Gemini API keys
-- POST /list-models: list Gemini/Groq models
-- GET /health: liveness check (includes version, so deploys are verifiable)
-
-V4 changes (2026-10-13):
-1. SPEED: all text regions are now translated CONCURRENTLY (asyncio.gather,
-   max 5 in flight) instead of one sequential API call per region. A page
-   with N bubbles used to take N round-trips; now it takes ~1.
-2. RTL: arabic_reshaper/python-bidi failures are now LOGGED loudly instead of
-   silently falling back to unshaped text; Arabic-capable fonts are preferred
-   first for RTL targets (DejaVu Sans has no Arabic glyphs).
-3. INPAINT: optional LaMa inpainting (USE_LAMA=True). Falls back to the
-   strengthened OpenCV path on ANY LaMa failure, with a loud log line.
-   Needs: pip install simple-lama-inpainting  (first use downloads ~200MB
-   of model weights automatically; torch CPU is already a dependency).
-   NOTE: LaMa is much slower on CPU than OpenCV (seconds per page vs ~1s).
-4. /health now reports the running version, so you can verify which file
-   is actually deployed: curl http://localhost:8000/health
-
-Deploy (full-file replacement — never patch in place):
-1. Put this file's content into app.py in the Manga-server-v3 GitHub repo.
-2. On the EC2 instance:
-     sudo curl -sL https://raw.githubusercontent.com/saidkhassouani17-star/Manga-server-v3/main/app.py -o /opt/manga-server/app.py
-     # only if USE_LAMA=True and not installed yet:
-     sudo /opt/manga-server/venv/bin/pip install simple-lama-inpainting
-     sudo systemctl restart manga-api
-     sleep 3
-     curl -s http://localhost:8000/health   # must show "v4-20261013"
+Manga Translation Server — v5.0 (PaddleOCR 3.x + LaMa Only Edition)
+===================================================================
+- OCR: PaddleOCR 3.x (Thread-safe + Kaggle PIR/MKLDNN/PDX/LangChain fixes)
+- Inpainting: SimpleLama (LaMa PyTorch model)
+- Translation: Groq / DeepL / Google Translate fallback
+- Arabic Rendering: Pillow + arabic_reshaper + python-bidi (Bubble-aware word wrap)
 """
-import asyncio
-import base64
-import io
-import json
-import logging
+
 import os
-from typing import List, Optional, Tuple
+import sys
+import types
+import threading
+import io
+import re
+import time
+import base64
+import logging
+import urllib.request
+from typing import List, Dict, Any, Optional
 
-import cv2
-import httpx
+# ---------------------------------------------------------------------------
+# 1. KAGGLE & PADDLEX PRE-INITIALIZATION FIXES (MUST RUN BEFORE ANY IMPORTS)
+# ---------------------------------------------------------------------------
+os.environ["DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["USE_LAMA"] = "true"
+
+# Mock deprecated langchain submodules required by paddlex on Kaggle (Python 3.12/3.13)
+for _mod in [
+    "langchain",
+    "langchain.docstore",
+    "langchain.docstore.document",
+    "langchain.text_splitter",
+]:
+    if _mod not in sys.modules:
+        sys.modules[_mod] = types.ModuleType(_mod)
+sys.modules["langchain.docstore.document"].Document = object
+sys.modules["langchain.text_splitter"].RecursiveCharacterTextSplitter = object
+
+# ---------------------------------------------------------------------------
+# 2. STANDARD IMPORTS
+# ---------------------------------------------------------------------------
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import httpx
+from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException
+from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("manga-server")
+logger = logging.getLogger("manga-server")
 
-app = FastAPI(title="Manga Translation Server")
+# RTL Arabic shaping support
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    RTL_AVAILABLE = True
+    logger.info("RTL shaping: available (arabic_reshaper + python-bidi)")
+except ImportError:
+    RTL_AVAILABLE = False
+    logger.warning("RTL shaping libraries not found! Arabic text may appear disconnected.")
 
-API_TOKEN = os.environ.get("API_TOKEN", "")
-
-VERSION = "v4.9-20261013"
-
-# Set False to skip LaMa entirely (pure OpenCV inpaint, fastest).
-USE_LAMA = True
-
-# ---------------------------------------------------------------- OCR ----
+# ---------------------------------------------------------------------------
+# 3. GLOBAL SINGLETONS & THREAD LOCKS (PaddleOCR + LaMa ONLY)
+# ---------------------------------------------------------------------------
 _ocr_reader = None
-_ocr_backend = None  # "paddle" or "easyocr"
+_ocr_backend = "paddle"
+_ocr_lock = threading.Lock()
+
+_lama = None
+_lama_lock = threading.Lock()
+
+
+def _patch_paddlex_reinit():
+    """Prevent RuntimeError: PDX has already been initialized."""
+    try:
+        import paddlex.repo_manager.core as _pdx_core
+        _orig_init = _pdx_core.initialize
+
+        def _safe_init(*args, **kwargs):
+            if _pdx_core._GlobalContext.is_initialized():
+                return
+            return _orig_init(*args, **kwargs)
+
+        _pdx_core.initialize = _safe_init
+    except Exception:
+        pass
 
 
 def get_ocr():
-    """Lazy-load OCR engine. EasyOCR (English). RapidOCR misreads English
-    comic text as Chinese/garbage, so it's disabled."""
+    """Initialize and return PaddleOCR 3.x reader (strictly no fallback)."""
     global _ocr_reader, _ocr_backend
     if _ocr_reader is not None:
         return _ocr_reader, _ocr_backend
-    import easyocr
-    # English-only: the content is English (translated manhwa).
-    _ocr_reader = easyocr.Reader(["en"], gpu=False)
-    _ocr_backend = "easyocr"
-    log.info("EasyOCR ready (en)")
+    with _ocr_lock:
+        if _ocr_reader is not None:
+            return _ocr_reader, _ocr_backend
+        _patch_paddlex_reinit()
+        from paddleocr import PaddleOCR
+        logger.info("Initializing PaddleOCR 3.x engine (enable_mkldnn=False)...")
+        _ocr_reader = PaddleOCR(
+            lang="en",
+            enable_mkldnn=False,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+        _ocr_backend = "paddle"
+        logger.info("PaddleOCR 3.x engine loaded successfully.")
     return _ocr_reader, _ocr_backend
 
 
-def downscale_image(image_bytes: bytes, max_width: int = 1000) -> bytes:
-    """Downscale a page whose WIDTH exceeds max_width.
+class DirectLaMaFallback:
+    """Direct TorchScript big-lama.pt runner if simple_lama_inpainting package has issues."""
+    def __init__(self):
+        import torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_url = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
+        model_path = "/tmp/big-lama.pt"
+        if not os.path.exists(model_path):
+            logger.info("Downloading LaMa weights (big-lama.pt)...")
+            urllib.request.urlretrieve(model_url, model_path)
+        self.model = torch.jit.load(model_path, map_location=self.device)
+        self.model.eval()
+        self.torch = torch
 
-    Webtoon pages are long and narrow: scaling by max dimension would make
-    the text microscopic and unreadable for OCR. Limit by width only.
-    OCR + LaMa on CPU are much faster on a smaller image, and 1000px wide
-    is plenty for phone display. Returns JPEG bytes (original if already small).
-    """
-    img = Image.open(io.BytesIO(image_bytes))
-    w, h = img.size
-    if w <= max_width:
-        return image_bytes
-    scale = max_width / w
-    nw, nh = int(w * scale), int(h * scale)
-    img = img.convert("RGB").resize((nw, nh), Image.LANCZOS)
-    log.info("Downscaled page %dx%d -> %dx%d for faster processing", w, h, nw, nh)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=88)
-    return buf.getvalue()
-
-
-def clean_text(text: str) -> str:
-    """Remove characters the fonts can't render (prevents tofu boxes).
-
-    Keeps Arabic, Latin, digits, common punctuation and whitespace.
-    Drops everything else (CJK, symbols, control codes...).
-    """
-    kept = []
-    for ch in text:
-        o = ord(ch)
-        if (0x0600 <= o <= 0x06FF or   # Arabic
-                0xFB50 <= o <= 0xFDFF or   # Arabic presentation A
-                0xFE70 <= o <= 0xFEFF or   # Arabic presentation B
-                0x0020 <= o <= 0x024F or   # Latin + extended
-                0x2000 <= o <= 0x206F or   # General punctuation
-                ch in "\n\t"):
-            kept.append(ch)
-    out = "".join(kept).strip()
-    if out != text.strip():
-        log.warning("Stripped unrunderable chars: %r -> %r", text[:60], out[:60])
-    return out
-
-
-def merge_regions(regions: List[dict]) -> List[dict]:
-    """Merge OCR fragments belonging to the same text block.
-
-    EasyOCR returns line-level boxes; a bubble's sentence split across lines
-    must be translated as ONE unit, otherwise each fragment is translated in
-    isolation and loses context (e.g. "TO SAY?" -> wrong pronoun).
-    Two regions merge if they are horizontally aligned and vertically close.
-    """
-    if len(regions) <= 1:
-        return regions
-    groups = []  # {"box": [...], "texts": [...], "scores": [...]}
-    for r in sorted(regions, key=lambda r: (r["box"][1], r["box"][0])):
-        x1, y1, x2, y2 = r["box"]
-        h = max(1, y2 - y1)
-        target = None
-        for g in groups:
-            gx1, gy1, gx2, gy2 = g["box"]
-            gh = max(1, gy2 - gy1)
-            overlap = max(0, min(x2, gx2) - max(x1, gx1))
-            min_w = max(1, min(x2 - x1, gx2 - gx1))
-            v_gap = max(gy1 - y2, y1 - gy2, 0)
-            if overlap / min_w > 0.2 and v_gap < max(h, gh) * 1.5:
-                target = g
-                break
-        if target is None:
-            groups.append({"box": [x1, y1, x2, y2],
-                           "texts": [r["text"]], "scores": [r["score"]]})
-        else:
-            b = target["box"]
-            b[0] = min(b[0], x1); b[1] = min(b[1], y1)
-            b[2] = max(b[2], x2); b[3] = max(b[3], y2)
-            target["texts"].append(r["text"])
-            target["scores"].append(r["score"])
-    out = [{"text": " ".join(g["texts"]), "box": g["box"],
-            "score": min(g["scores"])} for g in groups]
-    out.sort(key=lambda r: (r["box"][1], r["box"][0]))
-    log.info("Merged %d OCR fragments -> %d text blocks", len(regions), len(out))
-    return out
-
-
-def run_ocr(image_bytes: bytes) -> List[dict]:
-    """Return [{'text': str, 'box': [x1,y1,x2,y2], 'score': float}, ...]."""
-    reader, backend = get_ocr()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    arr = np.array(img)
-    results = []
-    if backend == "paddle":
-        out = reader.ocr(arr, cls=False)
-        # PaddleOCR returns [[ [points], (text, score) ], ...]
-        pages = out[0] if out and out[0] else []
-        for item in pages:
-            pts, (text, score) = item[0], item[1]
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            results.append({
-                "text": text.strip(),
-                "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
-                "score": float(score),
-            })
-    else:
-        out = reader.readtext(arr)
-        for box, text, score in out:
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            results.append({
-                "text": text.strip(),
-                "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
-                "score": float(score),
-            })
-    # Drop empties and very low confidence
-    results = [r for r in results if r["text"] and r["score"] >= 0.25]
-    log.info("OCR (%s): %d regions", backend, len(results))
-    return results
-
-
-# ------------------------------------------------------- translation ----
-async def translate_deepl(text: str, target: str, key: str,
-                          endpoint: str = "auto") -> str:
-    base = ("https://api-free.deepl.com" if key.endswith(":fx") and endpoint == "auto"
-            else "https://api.deepl.com" if endpoint in ("auto", "paid")
-            else "https://api-free.deepl.com")
-    if endpoint == "free":
-        base = "https://api-free.deepl.com"
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(f"{base}/v2/translate",
-                         headers={"Authorization": f"DeepL-Auth-Key {key}"},
-                         json={"text": [text],
-                               "target_lang": target.upper()})
-        r.raise_for_status()
-        return r.json()["translations"][0]["text"]
-
-
-async def translate_groq(text: str, target: str, key: str,
-                         model: str = "llama-3.3-70b-versatile",
-                         glossary: dict = None) -> str:
-    sys = (f"You are a manga translator. Translate the following text to "
-           f"{target}. Return ONLY the translation, no explanations.")
-    if glossary:
-        pairs = "; ".join(f'"{k}" -> "{v}"' for k, v in glossary.items())
-        sys += f" Use this glossary: {pairs}."
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": model,
-                  "messages": [{"role": "system", "content": sys},
-                               {"role": "user", "content": text}],
-                  "temperature": 0.3})
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
-
-
-async def translate_gemini(text: str, target: str, key: str,
-                           model: str = "gemini-2.0-flash",
-                           glossary: dict = None) -> str:
-    prompt = (f"Translate the following manga text to {target}. "
-              f"Return ONLY the translation.")
-    if glossary:
-        pairs = "; ".join(f'"{k}" -> "{v}"' for k, v in glossary.items())
-        prompt += f" Glossary: {pairs}."
-    prompt += f"\n\n{text}"
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={key}",
-            json={"contents": [{"parts": [{"text": prompt}]}]})
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-
-async def translate_text(text: str, target: str, priority: List[str],
-                         keys: dict, models: dict,
-                         glossary: dict) -> Tuple[str, str]:
-    """Try providers in order. Returns (translated, provider_used)."""
-    # Apply glossary first (exact replacements)
-    for k, v in (glossary or {}).items():
-        text = text.replace(k, v)
-    last_err = "no provider configured"
-    for p in priority:
-        p = p.strip().lower()
-        try:
-            if p == "deepl" and keys.get("deepl"):
-                t = await translate_deepl(text, target, keys["deepl"])
-                return t, "deepl"
-            if p == "groq" and keys.get("groq"):
-                t = await translate_groq(text, target, keys["groq"],
-                                         models.get("groq", "llama-3.3-70b-versatile"),
-                                         glossary)
-                return t, "groq"
-            if p == "gemini" and keys.get("gemini"):
-                t = await translate_gemini(text, target, keys["gemini"],
-                                           models.get("gemini", "gemini-2.0-flash"),
-                                           glossary)
-                return t, "gemini"
-        except Exception as e:
-            last_err = f"{p}: {e}"
-            log.warning("Provider %s failed: %s", p, e)
-    raise RuntimeError(f"All providers failed. Last error: {last_err}")
-
-
-async def translate_all(regions: List[dict], target_lang: str,
-                        priority: List[str], keys: dict, models: dict,
-                        glossary: dict) -> Optional[str]:
-    """Translate every region CONCURRENTLY. Returns provider used.
-
-    Same failure contract as before: if a region's providers all fail,
-    the exception propagates and /translate answers HTTP 500 with an
-    error (never a partial image).
-    """
-    sem = asyncio.Semaphore(5)
-
-    async def one(r: dict):
-        async with sem:
-            return await translate_text(r["text"], target_lang, priority,
-                                        keys, models, glossary)
-
-    results = await asyncio.gather(*(one(r) for r in regions))
-    provider_used = None
-    for r, (t, p) in zip(regions, results):
-        r["translated"] = t
-        log.info("Region OCR=%r -> translated=%r (via %s)",
-                 r["text"][:80], t[:80], p)
-        if provider_used is None and p:
-            provider_used = p
-    return provider_used
-
-
-# ------------------------------------------------------------ inpaint ----
-_lama = None
-_lama_failed = False
+    def __call__(self, image: Image.Image, mask: Image.Image) -> Image.Image:
+        torch = self.torch
+        img_np = np.array(image.convert("RGB"))
+        mask_np = np.array(mask.convert("L"))
+        h, w = img_np.shape[:2]
+        pad_h = (8 - h % 8) % 8
+        pad_w = (8 - w % 8) % 8
+        if pad_h > 0 or pad_w > 0:
+            img_np = np.pad(img_np, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+            mask_np = np.pad(mask_np, ((0, pad_h), (0, pad_w)), mode="reflect")
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(self.device)
+        mask_t = (torch.from_numpy(mask_np).float().div(255.0) > 0.5).float().unsqueeze(0).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            inpainted = self.model(img_t, mask_t)
+        res = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
+        res = np.clip(res * 255, 0, 255).astype(np.uint8)
+        return Image.fromarray(res[:h, :w])
 
 
 def get_lama():
-    """Lazy-load LaMa inpainting (simple-lama-inpainting, CPU)."""
-    global _lama, _lama_failed
-    if not USE_LAMA or _lama_failed:
-        return None
-    if _lama is None:
+    """Initialize and return LaMa inpainting model."""
+    global _lama
+    if _lama is not None:
+        return _lama
+    with _lama_lock:
+        if _lama is not None:
+            return _lama
+        logger.info("Initializing LaMa inpainting model...")
         try:
             from simple_lama_inpainting import SimpleLama
-            log.info("Loading LaMa inpainting model (first use downloads weights)...")
             _lama = SimpleLama()
-            log.info("LaMa inpainting ready")
+            logger.info("SimpleLama loaded successfully.")
         except Exception as e:
-            _lama_failed = True
-            log.error("LaMa failed to load (%s); using OpenCV inpaint instead", e)
+            logger.warning(f"SimpleLama import failed ({e}), loading DirectLaMa (big-lama.pt)...")
+            _lama = DirectLaMaFallback()
+            logger.info("DirectLaMa loaded successfully.")
     return _lama
 
 
-def inpaint_opencv(arr, mask):
-    """Strengthened OpenCV inpaint: pad + dilated mask + INPAINT_NS."""
-    return cv2.inpaint(arr, mask, 15, cv2.INPAINT_NS)
+# ---------------------------------------------------------------------------
+# 4. OCR & BUBBLE GROUPING PIPELINE
+# ---------------------------------------------------------------------------
+def run_ocr(image: Image.Image) -> List[Dict[str, Any]]:
+    """Run PaddleOCR 3.x on PIL image and return list of {text, box, score}."""
+    reader, _ = get_ocr()
+    arr = np.array(image.convert("RGB"))
+    results = []
+    with _ocr_lock:
+        # Support both PaddleOCR 3.x .predict() and 2.x .ocr()
+        if hasattr(reader, "predict"):
+            out = list(reader.predict(arr))
+            d = out[0] if out else {}
+            rec_texts = d.get("rec_texts", []) if hasattr(d, "get") else getattr(d, "rec_texts", [])
+            rec_scores = d.get("rec_scores", []) if hasattr(d, "get") else getattr(d, "rec_scores", [])
+            dt_polys = d.get("dt_polys", []) if hasattr(d, "get") else getattr(d, "dt_polys", [])
+            for t, s, poly in zip(rec_texts, rec_scores, dt_polys):
+                text_str = str(t).strip()
+                if not text_str:
+                    continue
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                results.append({
+                    "text": text_str,
+                    "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
+                    "score": float(s),
+                })
+        else:
+            out = reader.ocr(arr, cls=False)
+            lines = out[0] if (out and out[0]) else []
+            for line in lines:
+                poly, (t, s) = line[0], line[1]
+                text_str = str(t).strip()
+                if not text_str:
+                    continue
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                results.append({
+                    "text": text_str,
+                    "box": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
+                    "score": float(s),
+                })
+    return results
 
 
-def inpaint_with_lama(arr, mask, lama):
-    img_pil = Image.fromarray(arr).convert("RGB")
-    mask_pil = Image.fromarray(mask).convert("L")
-    out = lama(img_pil, mask_pil)
-    return np.array(out.convert("RGB"))
+def merge_nearby_boxes(items: List[Dict[str, Any]], img_w: int, img_h: int) -> List[Dict[str, Any]]:
+    """Group nearby OCR lines inside the same speech bubble into paragraphs."""
+    if not items:
+        return []
+    # Sort top-to-bottom, then left-to-right
+    items = sorted(items, key=lambda x: (x["box"][1], x["box"][0]))
+    clusters: List[List[Dict[str, Any]]] = []
+
+    for item in items:
+        x1, y1, x2, y2 = item["box"]
+        line_h = max(12, y2 - y1)
+        placed = False
+        for cluster in clusters:
+            cx1 = min(c["box"][0] for c in cluster)
+            cy1 = min(c["box"][1] for c in cluster)
+            cx2 = max(c["box"][2] for c in cluster)
+            cy2 = max(c["box"][3] for c in cluster)
+
+            # Vertical gap and horizontal overlap check
+            v_gap = y1 - cy2
+            h_overlap = min(x2, cx2) - max(x1, cx1)
+            min_w = min(x2 - x1, cx2 - cx1)
+            center_dist_x = abs(((x1 + x2) / 2) - ((cx1 + cx2) / 2))
+
+            if -line_h * 0.5 <= v_gap <= line_h * 1.4 and (
+                h_overlap > -line_h * 0.8 or center_dist_x < max(cx2 - cx1, x2 - x1) * 0.65
+            ):
+                cluster.append(item)
+                placed = True
+                break
+        if not placed:
+            clusters.append([item])
+
+    merged = []
+    for cluster in clusters:
+        cluster = sorted(cluster, key=lambda x: (x["box"][1], x["box"][0]))
+        full_text = " ".join(c["text"] for c in cluster).strip()
+        bx1 = max(0, min(c["box"][0] for c in cluster))
+        by1 = max(0, min(c["box"][1] for c in cluster))
+        bx2 = min(img_w, max(c["box"][2] for c in cluster))
+        by2 = min(img_h, max(c["box"][3] for c in cluster))
+        avg_score = sum(c.get("score", 1.0) for c in cluster) / len(cluster)
+        merged.append({
+            "text": full_text,
+            "box": [bx1, by1, bx2, by2],
+            "lines": [c["box"] for c in cluster],
+            "score": float(avg_score),
+        })
+    return merged
 
 
-# ----------------------------------------------------------- render ----
-RTL_LANGS = {"ar", "he", "fa", "ur"}
+# ---------------------------------------------------------------------------
+# 5. INPAINTING WITH LAMA ONLY
+# ---------------------------------------------------------------------------
+def inpaint_bubbles_lama(image: Image.Image, bubbles: List[Dict[str, Any]]) -> Image.Image:
+    """Erase text regions using LaMa inpainting model."""
+    if not bubbles:
+        return image
+    lama_model = get_lama()
+    w, h = image.size
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
 
-ARABIC_FONT_PATHS = [
-    "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
-]
-LATIN_FONT_PATHS = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-]
+    pad = 6
+    for b in bubbles:
+        sub_boxes = b.get("lines") or [b["box"]]
+        for sb in sub_boxes:
+            x1, y1, x2, y2 = sb
+            draw.rectangle(
+                [max(0, x1 - pad), max(0, y1 - pad), min(w, x2 + pad), min(h, y2 + pad)],
+                fill=255,
+            )
+
+    with _lama_lock:
+        cleaned = lama_model(image.convert("RGB"), mask)
+    return cleaned
 
 
-def shape_rtl(text: str) -> str:
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-        return get_display(arabic_reshaper.reshape(text))
-    except Exception as e:
-        # LOUD failure: silent fallback was the cause of "Arabic reads LTR"
-        log.error("RTL shaping unavailable (%s): install arabic-reshaper + python-bidi", e)
-        return text
+# ---------------------------------------------------------------------------
+# 6. TRANSLATION ENGINE (Groq / DeepL / Google GTX Fallback)
+# ---------------------------------------------------------------------------
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "")
 
 
-def find_font(size: int, rtl: bool = False) -> ImageFont.FreeTypeFont:
-    # DejaVu Sans has NO Arabic glyphs, so for RTL targets try
-    # Arabic-capable fonts first.
-    paths = (ARABIC_FONT_PATHS + LATIN_FONT_PATHS) if rtl else \
-            (LATIN_FONT_PATHS + ARABIC_FONT_PATHS)
-    for path in paths:
-        if os.path.exists(path):
+async def translate_texts(
+    texts: List[str],
+    target_lang: str = "ar",
+    source_lang: str = "auto",
+    groq_key: Optional[str] = None,
+    deepl_key: Optional[str] = None,
+) -> List[str]:
+    if not texts:
+        return []
+
+    g_key = groq_key or GROQ_API_KEY
+    d_key = deepl_key or DEEPL_API_KEY
+
+    # 1. Try Groq LLM batch translation if key is provided
+    if g_key:
+        try:
+            numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+            prompt = (
+                f"Translate the following manga/comic dialogue lines into natural Arabic. "
+                f"Return ONLY the translated lines numbered 1 to {len(texts)}, one per line, without extra commentary:\n\n{numbered}"
+            )
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {g_key}"},
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                    },
+                )
+                if r.status_code == 200:
+                    content = r.json()["choices"][0]["message"]["content"].strip()
+                    lines = [
+                        re.sub(r"^\d+[\.)\-:\s]+", "", line).strip()
+                        for line in content.splitlines()
+                        if line.strip()
+                    ]
+                    if len(lines) == len(texts):
+                        return lines
+        except Exception as e:
+            logger.warning(f"Groq translation fallback triggered: {e}")
+
+    # 2. Try DeepL if key is provided
+    if d_key:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.post(
+                    "https://api-free.deepl.com/v2/translate",
+                    headers={"Authorization": f"DeepL-Auth-Key {d_key}"},
+                    data={"text": texts, "target_lang": target_lang.upper()},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    return [item["text"] for item in data.get("translations", [])]
+        except Exception as e:
+            logger.warning(f"DeepL translation fallback triggered: {e}")
+
+    # 3. Reliable Free Google Translate GTX endpoint
+    translated = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for t in texts:
             try:
-                return ImageFont.truetype(path, size)
+                r = await client.get(
+                    "https://translate.googleapis.com/translate_a/single",
+                    params={
+                        "client": "gtx",
+                        "sl": source_lang if source_lang != "auto" else "auto",
+                        "tl": target_lang,
+                        "dt": "t",
+                        "q": t,
+                    },
+                )
+                if r.status_code == 200:
+                    segs = r.json()[0]
+                    translated.append("".join(s[0] for s in segs if s and s[0]))
+                else:
+                    translated.append(t)
             except Exception:
-                pass
-    log.error("No usable font file found; falling back to PIL default bitmap font")
+                translated.append(t)
+    return translated
+
+
+# ---------------------------------------------------------------------------
+# 7. ARABIC FONT & TEXT RENDERING
+# ---------------------------------------------------------------------------
+def _find_font_paths() -> List[str]:
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    found = [p for p in candidates if os.path.exists(p)]
+    logger.info(f"Font files found: {found}")
+    return found
+
+
+FONT_PATHS = _find_font_paths()
+
+
+def get_font(size: int) -> ImageFont.FreeTypeFont:
+    for fp in FONT_PATHS:
+        try:
+            return ImageFont.truetype(fp, size=size)
+        except Exception:
+            continue
     return ImageFont.load_default()
 
 
-def render_translations(image_bytes: bytes, items: List[dict],
-                        target_lang: str) -> bytes:
-    """Erase original text and draw translations inside boxes."""
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    arr = np.array(img)
-    rtl = target_lang.lower() in RTL_LANGS
-
-    # Drop regions the provider echoed back untranslated (translated == source):
-    # drawing them would render tofu boxes for scripts the font lacks.
-    # Leaving them untouched keeps the original text readable instead.
-    kept = []
-    for it in items:
-        src, dst = (it.get("text") or "").strip(), (it.get("translated") or "").strip()
-        if dst and dst != src:
-            kept.append(it)
-        else:
-            log.warning("Skipping untranslated region (leaving original): %r", src[:60])
-    items = kept
-    if not items:
-        log.info("No translatable regions; returning original image")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=92)
-        return buf.getvalue()
-
-    # 1. Inpaint original text areas
-    mask = np.zeros(arr.shape[:2], dtype=np.uint8)
-    for it in items:
-        x1, y1, x2, y2 = it["box"]
-        pad = 10  # Larger padding to cover text edges
-        cv2.rectangle(mask,
-                      (max(0, x1 - pad), max(0, y1 - pad)),
-                      (min(arr.shape[1], x2 + pad), min(arr.shape[0], y2 + pad)),
-                      255, -1)
-    # Dilate mask to ensure full text coverage
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    mask = cv2.dilate(mask, kernel, iterations=2)
-
-    lama = get_lama()
-    backend_name = "opencv"
-    if lama is not None:
+def shape_arabic(text: str) -> str:
+    if not text:
+        return ""
+    if RTL_AVAILABLE:
         try:
-            log.info("Inpainting %d regions with LaMa (CPU, may take a while)...",
-                     len(items))
-            arr = inpaint_with_lama(arr, mask, lama)
-            backend_name = "lama"
-        except Exception as e:
-            log.error("LaMa inpaint failed (%s); falling back to OpenCV", e)
-            arr = inpaint_opencv(arr, mask)
-    else:
-        arr = inpaint_opencv(arr, mask)
-    log.info("Inpaint backend used: %s", backend_name)
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        except Exception:
+            return text
+    return text
 
-    img = Image.fromarray(arr)
-    draw = ImageDraw.Draw(img)
 
-    # 2. Draw translated text
-    for it in items:
-        text = clean_text(it["translated"])
-        if not text:
+def draw_translated_bubbles(image: Image.Image, bubbles: List[Dict[str, Any]]) -> Image.Image:
+    """Render translated Arabic text centered inside each cleaned bubble."""
+    draw = ImageDraw.Draw(image)
+    for b in bubbles:
+        raw_text = b.get("translated") or b.get("text", "")
+        if not raw_text:
             continue
-        if rtl:
-            text = shape_rtl(text)
-        x1, y1, x2, y2 = it["box"]
-        bw, bh = max(1, x2 - x1), max(1, y2 - y1)
-        # Auto-fit font size
-        size = max(8, bh // 2)
-        font = find_font(size, rtl=rtl)
-        # Shrink until it fits
-        while size > 8:
-            bbox = draw.multiline_textbbox((0, 0), text, font=font)
-            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            if tw <= bw * 0.95 and th <= bh * 0.95:
+        x1, y1, x2, y2 = b["box"]
+        bw = max(24, x2 - x1)
+        bh = max(20, y2 - y1)
+
+        words = raw_text.split()
+        if not words:
+            continue
+
+        best_font = get_font(16)
+        best_lines = [raw_text]
+
+        for font_size in range(min(36, max(14, int(bh * 0.45))), 11, -2):
+            font = get_font(font_size)
+            lines = []
+            current = ""
+            for w in words:
+                test_line = f"{current} {w}".strip()
+                shaped_test = shape_arabic(test_line)
+                bbox = draw.textbbox((0, 0), shaped_test, font=font)
+                tw = bbox[2] - bbox[0]
+                if tw <= bw * 1.08 or not current:
+                    current = test_line
+                else:
+                    lines.append(current)
+                    current = w
+            if current:
+                lines.append(current)
+
+            line_h = int(font_size * 1.28)
+            total_h = line_h * len(lines)
+            if total_h <= bh * 1.25:
+                best_font = font
+                best_lines = lines
                 break
-            size -= 2
-            font = find_font(size, rtl=rtl)
-        bbox = draw.multiline_textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        tx = x1 + (bw - tw) // 2
-        ty = y1 + (bh - th) // 2
-        # Black outline + white fill (scanlation style)
-        for ox, oy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-            draw.multiline_text((tx + ox, ty + oy), text, font=font, fill="black")
-        draw.multiline_text((tx, ty), text, font=font, fill="white")
+            best_font = font
+            best_lines = lines
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=92)
-    return buf.getvalue()
+        font_size = getattr(best_font, "size", 16)
+        line_h = int(font_size * 1.25)
+        total_h = line_h * len(best_lines)
+        curr_y = y1 + (bh - total_h) / 2
+
+        for line in best_lines:
+            shaped = shape_arabic(line)
+            bbox = draw.textbbox((0, 0), shaped, font=best_font)
+            tw = bbox[2] - bbox[0]
+            curr_x = x1 + (bw - tw) / 2
+            # White stroke outline + black text for crisp readability on any background
+            draw.text(
+                (curr_x, curr_y),
+                shaped,
+                font=best_font,
+                fill=(0, 0, 0),
+                stroke_width=3,
+                stroke_fill=(255, 255, 255),
+            )
+            curr_y += line_h
+
+    return image
 
 
-# -------------------------------------------------------- endpoints ----
-def check_token(token: str):
-    if API_TOKEN and token != API_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid API token")
+# ---------------------------------------------------------------------------
+# 8. FASTAPI APPLICATION & ENDPOINTS
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Manga Server v5.0 (PaddleOCR + LaMa)", version="5.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
+@app.on_event("startup")
+async def startup_preload():
+    """Preload PaddleOCR and LaMa once at startup so first request never times out."""
+    logger.info("Preloading PaddleOCR 3.x and LaMa at server startup...")
+    try:
+        get_ocr()
+        get_lama()
+        logger.info("Startup preload completed: PaddleOCR + LaMa ready!")
+    except Exception as e:
+        logger.error(f"Startup preload warning: {e}")
+
+
+@app.get("/")
 @app.get("/health")
-def health():
-    return {"status": "ok", "version": VERSION}
+async def health_check():
+    return {
+        "status": "ok",
+        "version": "5.0.0",
+        "ocr_backend": "paddleocr-3.x",
+        "inpaint_backend": "lama",
+        "rtl": RTL_AVAILABLE,
+    }
 
 
-@app.post("/test-provider")
-async def test_provider(payload: dict, x_api_token: str = Header(default="")):
-    check_token(x_api_token)
-    provider = payload.get("provider", "").lower()
-    key = payload.get("api_key", "")
-    model = payload.get("model", "")
-    if not key:
-        return {"working": False, "error": "No API key provided"}
+async def _extract_image_from_request(
+    request: Request,
+    file: Optional[UploadFile] = None,
+    image: Optional[UploadFile] = None,
+) -> Image.Image:
+    upload = file or image
+    if upload is not None:
+        raw = await upload.read()
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        b64_str = body.get("image") or body.get("file") or body.get("data") or body.get("base64")
+        if b64_str:
+            if "," in b64_str:
+                b64_str = b64_str.split(",", 1)[1]
+            raw = base64.b64decode(b64_str)
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        img_url = body.get("url") or body.get("image_url")
+        if img_url:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                r = await client.get(img_url)
+                return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+    form = await request.form()
+    for key in ("file", "image", "data", "base64"):
+        if key in form:
+            val = form[key]
+            if hasattr(val, "read"):
+                raw = await val.read()
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            elif isinstance(val, str):
+                b64_str = val.split(",", 1)[1] if "," in val else val
+                raw = base64.b64decode(b64_str)
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+
+    raise HTTPException(status_code=400, detail="No valid image found in request.")
+
+
+@app.post("/ocr")
+async def ocr_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None),
+):
     try:
-        if provider == "deepl":
-            t = await translate_deepl("Hello", "AR", key)
-        elif provider == "groq":
-            t = await translate_groq("Hello", "Arabic", key,
-                                     model or "llama-3.3-70b-versatile")
-        elif provider == "gemini":
-            t = await translate_gemini("Hello", "Arabic", key,
-                                       model or "gemini-2.0-flash")
-        else:
-            return {"working": False, "error": f"Unknown provider: {provider}"}
-        return {"working": True, "sample": t[:80]}
+        pil_img = await _extract_image_from_request(request, file, image)
+        w, h = pil_img.size
+        raw_items = run_ocr(pil_img)
+        bubbles = merge_nearby_boxes(raw_items, w, h)
+        return {"status": "ok", "bubbles": bubbles, "raw": raw_items}
     except Exception as e:
-        return {"working": False, "error": str(e)[:200]}
-
-
-@app.post("/list-models")
-async def list_models(request: Request, x_api_token: str = Header(None)):
-    check_token(x_api_token or "")
-    payload = await request.json()
-    provider = payload.get("provider", "").lower()
-    key = payload.get("api_key", "")
-    if not key:
-        return {"models": [], "error": "No API key provided"}
-    try:
-        if provider == "gemini":
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={key}")
-                r.raise_for_status()
-                data = r.json()
-                models = []
-                for m in data.get("models", []):
-                    name = m.get("name", "").replace("models/", "")
-                    # Only text generation models
-                    methods = m.get("supportedGenerationMethods", [])
-                    if "generateContent" in methods:
-                        models.append({
-                            "id": name,
-                            "name": m.get("displayName", name),
-                        })
-                return {"models": models}
-        elif provider == "groq":
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.get(
-                    "https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {key}"})
-                r.raise_for_status()
-                data = r.json()
-                models = [{"id": m["id"], "name": m["id"]}
-                          for m in data.get("data", [])]
-                return {"models": models}
-        else:
-            return {"models": [], "error": f"Model listing not supported for: {provider}"}
-    except Exception as e:
-        return {"models": [], "error": str(e)[:200]}
+        logger.exception("OCR error")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/translate")
-async def translate(
-    image: UploadFile = File(...),
+@app.post("/translate-image")
+@app.post("/process")
+async def translate_image_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    image: Optional[UploadFile] = File(None),
     target_lang: str = Form("ar"),
     source_lang: str = Form("auto"),
-    provider_priority: str = Form("groq,deepl,gemini"),
-    glossary: str = Form("{}"),
-    deepl_key: str = Form(""),
-    groq_key: str = Form(""),
-    gemini_key: str = Form(""),
-    groq_model: str = Form("llama-3.3-70b-versatile"),
-    gemini_model: str = Form("gemini-2.0-flash"),
-    deepl_endpoint: str = Form("auto"),
-    x_api_token: str = Header(default=""),
+    response_format: str = Form("auto"),
+    groq_api_key: Optional[str] = Form(None),
+    deepl_api_key: Optional[str] = Form(None),
 ):
-    check_token(x_api_token)
+    t0 = time.time()
     try:
-        image_bytes = await image.read()
-        if not image_bytes:
-            raise ValueError("Empty image")
-        # Downscale huge pages first: OCR + LaMa on CPU are much faster.
-        # (Width-based: webtoon pages are long/narrow, height-based scaling
-        # would make text microscopic.)
-        image_bytes = downscale_image(image_bytes, max_width=1000)
-        # 1. OCR
-        regions = run_ocr(image_bytes)
-        if not regions:
-            # Page has no text: nothing to translate. Return the original
-            # image so the reader shows it normally instead of an error.
-            log.info("No text detected; returning original image")
-            b64 = base64.b64encode(image_bytes).decode()
-            return {"translated_image": b64, "provider_used": None,
-                    "regions": 0}
-        # Merge fragments of the same bubble/sentence so translation keeps context
-        regions = merge_regions(regions)
-        # 2. Translate each region (concurrently)
-        try:
-            glossary_dict = json.loads(glossary) if glossary else {}
-        except Exception:
-            glossary_dict = {}
-        keys = {"deepl": deepl_key, "groq": groq_key, "gemini": gemini_key}
-        models = {"groq": groq_model, "gemini": gemini_model}
-        priority = [p for p in provider_priority.split(",") if p.strip()]
-        provider_used = await translate_all(regions, target_lang, priority,
-                                            keys, models, glossary_dict)
-        # 3. Render
-        out_bytes = render_translations(image_bytes, regions, target_lang)
-        b64 = base64.b64encode(out_bytes).decode()
-        return {"translated_image": b64, "provider_used": provider_used,
-                "regions": len(regions)}
-    except HTTPException:
-        raise
+        pil_img = await _extract_image_from_request(request, file, image)
+        w, h = pil_img.size
+
+        # Parse JSON options if sent as JSON
+        if "application/json" in request.headers.get("content-type", ""):
+            try:
+                body = await request.json()
+                target_lang = body.get("target_lang", target_lang)
+                source_lang = body.get("source_lang", source_lang)
+                response_format = body.get("response_format", body.get("format", response_format))
+                groq_api_key = body.get("groq_api_key", groq_api_key)
+                deepl_api_key = body.get("deepl_api_key", deepl_api_key)
+            except Exception:
+                pass
+
+        # 1. OCR (PaddleOCR 3.x)
+        raw_items = run_ocr(pil_img)
+        bubbles = merge_nearby_boxes(raw_items, w, h)
+
+        if bubbles:
+            # 2. Translate
+            texts_to_translate = [b["text"] for b in bubbles]
+            translations = await translate_texts(
+                texts_to_translate,
+                target_lang=target_lang,
+                source_lang=source_lang,
+                groq_key=groq_api_key,
+                deepl_key=deepl_api_key,
+            )
+            for b, tr in zip(bubbles, translations):
+                b["translated"] = tr
+
+            # 3. Inpaint (LaMa)
+            cleaned_img = inpaint_bubbles_lama(pil_img, bubbles)
+
+            # 4. Draw Arabic text
+            final_img = draw_translated_bubbles(cleaned_img, bubbles)
+        else:
+            final_img = pil_img
+
+        buf = io.BytesIO()
+        final_img.save(buf, format="JPEG", quality=92)
+        img_bytes = buf.getvalue()
+        b64_img = base64.b64encode(img_bytes).decode("utf-8")
+
+        elapsed = round(time.time() - t0, 2)
+        accept = request.headers.get("accept", "")
+        if response_format == "image" or ("image/" in accept and response_format == "auto"):
+            return Response(content=img_bytes, media_type="image/jpeg")
+
+        return {
+            "status": "ok",
+            "image": b64_img,
+            "image_base64": f"data:image/jpeg;base64,{b64_img}",
+            "bubbles": bubbles,
+            "count": len(bubbles),
+            "elapsed_sec": elapsed,
+            "ocr": "paddleocr-3.x",
+            "inpaint": "lama",
+        }
     except Exception as e:
-        log.exception("translate failed")
-        # NEVER return the original image on failure — error only
-        return JSONResponse(status_code=500, content={"error": str(e)[:300]})
-
-
-def _startup_checks():
-    """Log environment sanity at import so journalctl shows what's missing."""
-    try:
-        import arabic_reshaper  # noqa: F401
-        from bidi.algorithm import get_display  # noqa: F401
-        log.info("RTL shaping: available (arabic_reshaper + python-bidi)")
-    except Exception as e:
-        log.error("RTL shaping NOT available (%s): Arabic will render LTR/disconnected", e)
-    found = [p for p in ARABIC_FONT_PATHS + LATIN_FONT_PATHS if os.path.exists(p)]
-    if found:
-        log.info("Font files found: %s", found)
-    else:
-        log.error("NO font files found; Arabic/Latin will use PIL default bitmap font")
-    log.info("LaMa inpaint: %s", "ENABLED (USE_LAMA=True)" if USE_LAMA else "disabled")
-    # Preload OCR at startup so the first /translate request doesn't pay the
-    # model download + load time (which can exceed the app's timeout).
-    # Wrapped: startup must never fail because of this.
-    try:
-        log.info("Preloading OCR engine (one-time cost at startup)...")
-        get_ocr()
-        log.info("OCR preload complete")
-    except Exception as e:
-        log.error("OCR preload failed (%s); will load lazily on first request", e)
-
-
-_startup_checks()
+        logger.exception("Translation pipeline error")
+        return JSONResponse(status_code=500, content={"error": str(e)})
